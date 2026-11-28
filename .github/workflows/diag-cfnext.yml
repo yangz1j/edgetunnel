@@ -33,3 +33,14 @@ jobs:
           curl -sS -X PUT "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/subdomain" -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" --data '{"subdomain":"yangz1j0923"}'; echo
           echo "== probe after =="
           echo "bogus: $(curl -sS --max-time 15 https://zzz-nonexistent-98765.yangz1j0923.workers.dev/ || true)"
+      - name: Probe Pages and DNS permissions
+        env:
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+        run: |
+          echo "== pages projects =="
+          curl -sS "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/pages/projects" -H "Authorization: Bearer $CF_API_TOKEN" | head -c 400; echo
+          echo "== token verify =="
+          curl -sS "https://api.cloudflare.com/client/v4/user/tokens/verify" -H "Authorization: Bearer $CF_API_TOKEN" | head -c 300; echo
+          echo "== pages.dev probe =="
+          echo "pages: $(curl -sS --max-time 15 https://zzz-nonexistent-98765.pages.dev/ || true)"
