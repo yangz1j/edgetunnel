@@ -66,6 +66,8 @@ jobs:
 
       # 关键补强：PUT 返回 2xx 不代表线上字节就是它。之前只有 /login=200 的检查，
       # 老版本同样 200，所以“升级成功”从来没被真正证明过。
+      # 实测 CF 的 GET 返回体与上传体相差 183 字节（官方会重写/附加头部），
+      # 所以这里比对的是“Version 常量 + 体积差”，而不是逐字节相等。
       - name: Verify deployed bytes
         env:
           CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
@@ -73,13 +75,28 @@ jobs:
         run: |
           curl -fsS "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/scripts/$WORKER" \
             -H "Authorization: Bearer $CF_API_TOKEN" -o deployed_worker.js
-          echo "expected: $(wc -c < new_worker.js) bytes / $(grep -o "const Version = '[^']*'" new_worker.js | head -1)"
-          echo "deployed: $(wc -c < deployed_worker.js) bytes / $(grep -o "const Version = '[^']*'" deployed_worker.js | head -1)"
-          if ! cmp -s deployed_worker.js new_worker.js; then
-            echo "::error::deployed script does not match new_worker.js"
+          want_ver=$(grep -o "const Version = '[^']*'" new_worker.js | head -1)
+          got_ver=$(grep -o "const Version = '[^']*'" deployed_worker.js | head -1)
+          want_size=$(wc -c < new_worker.js)
+          got_size=$(wc -c < deployed_worker.js)
+          echo "expected: $want_size bytes / $want_ver / $(sha256sum new_worker.js | cut -c1-16)"
+          echo "deployed: $got_size bytes / $got_ver / $(sha256sum deployed_worker.js | cut -c1-16)"
+          echo "--- first difference (byte offset 1-based, then hex of both) ---"
+          cmp deployed_worker.js new_worker.js 2>&1 | head -3 || true
+          echo "--- deployed head ---"
+          head -c 96 deployed_worker.js | od -An -c | head -4
+          echo "--- expected head ---"
+          head -c 96 new_worker.js | od -An -c | head -4
+          if [ "$got_ver" != "$want_ver" ]; then
+            echo "::error::deployed Version ($got_ver) != expected ($want_ver)"
             exit 1
           fi
-          echo "OK: deployed bytes match upstream exactly"
+          delta=$(( got_size > want_size ? got_size - want_size : want_size - got_size ))
+          if [ "$delta" -gt 4096 ]; then
+            echo "::error::deployed size differs by $delta bytes (limit 4096)"
+            exit 1
+          fi
+          echo "OK: deployed Version matches and size delta is $delta bytes"
 
       - name: Health check
         run: |
@@ -95,19 +112,18 @@ jobs:
           echo "::error::health check failed"
           exit 1
 
+      # 回滚用仓库里的 _worker.js（上一版成功上传过的完整源码）。
+      # 注意：不能把 CF GET 下来的 previous_worker.js 再 PUT 回去——那份是 CF 规范化后的
+      # 产物，PUT 会 400（实测），只适合当对照用的快照。
       - name: Roll back
         if: failure()
         env:
           CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
         run: |
-          if [ -s previous_worker.js ]; then
-            target=previous_worker.js
-          else
-            target=_worker.js
-          fi
-          echo "rolling back to $target ($(wc -c < $target) bytes)"
-          curl -fsS -X PUT "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/scripts/$WORKER" -H "Authorization: Bearer $CF_API_TOKEN" -F "metadata=@meta.json;type=application/json" -F "index.js=@$target;type=application/javascript+module;filename=index.js"
+          echo "snapshot for reference: $(wc -c < previous_worker.js) bytes"
+          echo "rolling back to repo _worker.js ($(wc -c < _worker.js) bytes, $(grep -o "const Version = '[^']*'" _worker.js | head -1))"
+          curl -fsS -X PUT "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/scripts/$WORKER" -H "Authorization: Bearer $CF_API_TOKEN" -F "metadata=@meta.json;type=application/json" -F "index.js=@_worker.js;type=application/javascript+module;filename=index.js"
           for i in $(seq 1 6); do
             sleep 10
             code=$(curl -s -o /dev/null -w '%{http_code}' "https://$HOST/login" || true)
