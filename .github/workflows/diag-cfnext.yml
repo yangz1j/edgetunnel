@@ -22,3 +22,14 @@ jobs:
           echo "cfnext: $(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 https://cfnext-worker.yangz1j0923.workers.dev/ || true)"
           echo "bogus:  $(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 https://zzz-nonexistent-98765.yangz1j0923.workers.dev/ || true)"
           echo "body:   $(curl -sS --max-time 15 https://cfnext-worker.yangz1j0923.workers.dev/ || true)"
+      - name: Try enabling workers.dev subdomain
+        env:
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+        run: |
+          echo "== current =="
+          curl -sS "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/subdomain" -H "Authorization: Bearer $CF_API_TOKEN"; echo
+          echo "== put same =="
+          curl -sS -X PUT "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/subdomain" -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" --data '{"subdomain":"yangz1j0923"}'; echo
+          echo "== probe after =="
+          echo "bogus: $(curl -sS --max-time 15 https://zzz-nonexistent-98765.yangz1j0923.workers.dev/ || true)"
