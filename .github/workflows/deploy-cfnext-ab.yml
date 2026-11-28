@@ -1,0 +1,154 @@
+name: deploy-cfnext-ab
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-cfnext-ab
+  cancel-in-progress: false
+
+env:
+  WORKER: cfnext-worker
+  # A/B 入口路径（随机，部署完记下来，用完删 worker）
+  ENTRY: ab7qk2
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch CFNext worker builds
+        run: |
+          # 小说混淆版 = 作者实际发布的形态（体积 1.4MB）；明文版只作可读对照
+          curl -fsSL "https://raw.githubusercontent.com/PAICNI/CFNext/main/CFNext-%E5%B0%8F%E8%AF%B4%E6%B7%B7%E6%B7%86%E7%89%88.js" -o cfnext-obf.js
+          curl -fsSL "https://raw.githubusercontent.com/PAICNI/CFNext/main/CFNext-%E6%98%8E%E6%96%87%E7%89%88.js" -o cfnext-plain.js
+          ls -l cfnext-obf.js cfnext-plain.js
+          cp cfnext-obf.js /tmp/check.mjs && node --check /tmp/check.mjs && echo "obf syntax OK"
+
+      - name: Ensure KV namespace
+        id: kv
+        env:
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+        run: |
+          ids=$(curl -fsS "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/storage/kv/namespaces?per_page=100" -H "Authorization: Bearer $CF_API_TOKEN")
+          ns=$(echo "$ids" | python3 -c "import json,sys;d=json.load(sys.stdin);print(next((n['id'] for n in d['result'] if n['title']=='cfnext-kv'),''))")
+          if [ -z "$ns" ]; then
+            echo "creating namespace cfnext-kv"
+            ns=$(curl -fsS -X POST "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/storage/kv/namespaces" \
+              -H "Authorization: Bearer $CF_API_TOKEN" -H 'Content-Type: application/json' \
+              --data '{"title":"cfnext-kv"}' | python3 -c "import json,sys;print(json.load(sys.stdin)['result']['id'])")
+          fi
+          echo "namespace=$ns"
+          echo "ns=$ns" >> "$GITHUB_OUTPUT"
+
+      - name: Build metadata
+        env:
+          ADMIN_PASS: ${{ secrets.ADMIN_PASS }}
+          NS: ${{ steps.kv.outputs.ns }}
+        run: |
+          python3 - <<'PY'
+          import json, os, uuid
+          meta = {
+              "main_module": "index.js",
+              "compatibility_date": "2025-11-04",
+              "bindings": [
+                  {"type": "kv_namespace", "name": "K", "namespace_id": os.environ["NS"]},
+                  {"type": "plain_text", "name": "U", "text": str(uuid.uuid4())},
+                  {"type": "plain_text", "name": "L", "text": os.environ["ENTRY"]},
+                  {"type": "plain_text", "name": "ADMIN", "text": os.environ["ADMIN_PASS"]},
+              ],
+          }
+          open("meta.json", "w").write(json.dumps(meta))
+          print("bindings:", [b["name"] for b in meta["bindings"]])
+          PY
+
+      - name: Deploy obfuscated build
+        env:
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+        run: |
+          curl -fsS -X PUT "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/scripts/$WORKER" \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
+            -F "metadata=@meta.json;type=application/json" \
+            -F "index.js=@cfnext-obf.js;type=application/javascript+module;filename=index.js" | head -c 600
+
+      - name: Bind custom domain (if the zone lives here)
+        id: domain
+        env:
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+        run: |
+          sub=$(curl -fsS "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/subdomain" -H "Authorization: Bearer $CF_API_TOKEN" \
+            | python3 -c "import json,sys;print(json.load(sys.stdin)['result']['subdomain'])")
+          fallback="https://$WORKER.$sub.workers.dev"
+          zid=$(curl -fsS "https://api.cloudflare.com/client/v4/zones?name=ccwu.cc" -H "Authorization: Bearer $CF_API_TOKEN" \
+            | python3 -c "import json,sys;d=json.load(sys.stdin);print(d['result'][0]['id'] if d['result'] else '')")
+          echo "zone=$zid  fallback=$fallback"
+          if [ -n "$zid" ]; then
+            resp=$(curl -sS -X PUT "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/domains" \
+              -H "Authorization: Bearer $CF_API_TOKEN" -H 'Content-Type: application/json' \
+              --data "{\"environment\":\"production\",\"hostname\":\"cfn.ccwu.cc\",\"service\":\"$WORKER\",\"zone_id\":\"$zid\"}")
+            echo "$resp" | head -c 500; echo
+          fi
+          # 自定义域名可能需要几秒下发；不通就用 workers.dev
+          base=""
+          for i in $(seq 1 6); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "https://cfn.ccwu.cc/$ENTRY" || true)
+            echo "custom domain try $i: $code"
+            if [ "$code" != "000" ] && [ -n "$code" ]; then base="https://cfn.ccwu.cc"; break; fi
+            sleep 10
+          done
+          if [ -z "$base" ]; then
+            code=$(curl -s -o /dev/null -w '%{http_code}' "$fallback/$ENTRY" || true)
+            echo "workers.dev: $code"
+            base="$fallback"
+          fi
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "using $base"
+
+      - name: Smoke test (obfuscated)
+        id: smoke
+        env:
+          BASE: ${{ steps.domain.outputs.base }}
+        run: |
+          echo "probe $BASE/$ENTRY"
+          for i in $(seq 1 12); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/$ENTRY" || true)
+            echo "try $i: $code"
+            if [ "$code" = "200" ]; then echo "ok"; exit 0; fi
+            sleep 10
+          done
+          echo "::error::obfuscated build did not serve 200"
+          exit 1
+
+      - name: Fallback to plaintext build
+        if: failure()
+        env:
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          BASE: ${{ steps.domain.outputs.base }}
+        run: |
+          curl -fsS -X PUT "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/scripts/$WORKER" \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
+            -F "metadata=@meta.json;type=application/json" \
+            -F "index.js=@cfnext-plain.js;type=application/javascript+module;filename=index.js" | head -c 300
+          for i in $(seq 1 12); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/$ENTRY" || true)
+            echo "plain try $i: $code"
+            if [ "$code" = "200" ]; then echo "plaintext build is live"; exit 0; fi
+            sleep 10
+          done
+          echo "::error::plaintext build also failed"
+          exit 1
+
+      - name: Print access info
+        if: success()
+        env:
+          BASE: ${{ steps.domain.outputs.base }}
+        run: |
+          echo "panel : $BASE/$ENTRY"
+          echo "sub   : $BASE/$ENTRY/sub/clash"
+          echo "worker: $WORKER"
