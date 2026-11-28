@@ -35,6 +35,22 @@ jobs:
           cp new_worker.js /tmp/check.mjs
           node --check /tmp/check.mjs
 
+      # 部署前先抓一份“当前线上字节”，回滚时用它，而不是仓库里的 _worker.js
+      # （仓库文件可能因为一次手工热修而和线上不一致）
+      - name: Snapshot current deployment
+        env:
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+        run: |
+          if curl -fsS "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/scripts/$WORKER" \
+               -H "Authorization: Bearer $CF_API_TOKEN" -o previous_worker.js; then
+            echo "snapshot: $(wc -c < previous_worker.js) bytes"
+            grep -o "const Version = '[^']*'" previous_worker.js | head -1 || true
+          else
+            echo "no existing deployment captured (first run?)"
+            : > previous_worker.js
+          fi
+
       - name: Build metadata
         env:
           ADMIN_PASS: ${{ secrets.ADMIN_PASS }}
@@ -47,6 +63,23 @@ jobs:
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
         run: |
           curl -fsS -X PUT "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/scripts/$WORKER" -H "Authorization: Bearer $CF_API_TOKEN" -F "metadata=@meta.json;type=application/json" -F "index.js=@new_worker.js;type=application/javascript+module;filename=index.js"
+
+      # 关键补强：PUT 返回 2xx 不代表线上字节就是它。之前只有 /login=200 的检查，
+      # 老版本同样 200，所以“升级成功”从来没被真正证明过。
+      - name: Verify deployed bytes
+        env:
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+        run: |
+          curl -fsS "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/scripts/$WORKER" \
+            -H "Authorization: Bearer $CF_API_TOKEN" -o deployed_worker.js
+          echo "expected: $(wc -c < new_worker.js) bytes / $(grep -o "const Version = '[^']*'" new_worker.js | head -1)"
+          echo "deployed: $(wc -c < deployed_worker.js) bytes / $(grep -o "const Version = '[^']*'" deployed_worker.js | head -1)"
+          if ! cmp -s deployed_worker.js new_worker.js; then
+            echo "::error::deployed script does not match new_worker.js"
+            exit 1
+          fi
+          echo "OK: deployed bytes match upstream exactly"
 
       - name: Health check
         run: |
@@ -68,8 +101,25 @@ jobs:
           CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
         run: |
-          curl -fsS -X PUT "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/scripts/$WORKER" -H "Authorization: Bearer $CF_API_TOKEN" -F "metadata=@meta.json;type=application/json" -F "index.js=@_worker.js;type=application/javascript+module;filename=index.js"
-          echo "rolled back to repo _worker.js"
+          if [ -s previous_worker.js ]; then
+            target=previous_worker.js
+          else
+            target=_worker.js
+          fi
+          echo "rolling back to $target ($(wc -c < $target) bytes)"
+          curl -fsS -X PUT "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/scripts/$WORKER" -H "Authorization: Bearer $CF_API_TOKEN" -F "metadata=@meta.json;type=application/json" -F "index.js=@$target;type=application/javascript+module;filename=index.js"
+          for i in $(seq 1 6); do
+            sleep 10
+            code=$(curl -s -o /dev/null -w '%{http_code}' "https://$HOST/login" || true)
+            sub=$(curl -s "https://$HOST/sub?token=$SUB_TOKEN&b64" | base64 -d | grep -c "vless://" || true)
+            echo "rollback try $i: login=$code vless=$sub"
+            if [ "$code" = "200" ] && [ "$sub" -gt 0 ]; then
+              echo "rolled back and healthy"
+              exit 0
+            fi
+          done
+          echo "::error::rollback did not become healthy"
+          exit 1
 
       - name: Record deployed version
         if: success()
